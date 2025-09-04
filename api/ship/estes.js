@@ -1,15 +1,25 @@
-// api/track/estes.js  — plain Vercel Node function (no Next helpers)
+// api/ship/estes.js — Vercel Node function
 const ENDPOINT = 'https://www.estes-express.com/shipmenttracking/services/ShipmentTrackingService';
 
+// CORS helper (adds Vary: Origin to avoid CDN caching the wrong ACAO)
 function cors(origin, allowList) {
-  if (!allowList) return { 'Access-Control-Allow-Origin': '*' };
+  if (!allowList) {
+    return {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Vary': 'Origin'
+    };
+  }
   const allow = allowList.split(',').map(s => s.trim());
   const allowAny = allow.includes('*');
   const ok = allowAny || (origin && allow.includes(origin));
+  const value = ok ? (allowAny ? '*' : origin) : (allow[0] || '*');
   return {
-    'Access-Control-Allow-Origin': ok ? (allowAny ? '*' : origin) : (allow[0] || '*'),
+    'Access-Control-Allow-Origin': value,
     'Access-Control-Allow-Methods': 'GET,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin'
   };
 }
 
