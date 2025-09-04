@@ -1,51 +1,63 @@
-// /api/track/estes.js
+// api/track/estes.js  — plain Vercel Node function (no Next helpers)
 const ENDPOINT = 'https://www.estes-express.com/shipmenttracking/services/ShipmentTrackingService';
 
-function corsHeaders(origin, allowList) {
+function cors(origin, allowList) {
   if (!allowList) return { 'Access-Control-Allow-Origin': '*' };
-  const allowed = allowList.split(',').map(s => s.trim());
-  const isAllowed = allowed.includes('*') || (origin && allowed.includes(origin));
+  const allow = allowList.split(',').map(s => s.trim());
+  const allowAny = allow.includes('*');
+  const ok = allowAny || (origin && allow.includes(origin));
   return {
-    'Access-Control-Allow-Origin': isAllowed ? origin : allowed[0] || '*',
+    'Access-Control-Allow-Origin': ok ? (allowAny ? '*' : origin) : (allow[0] || '*'),
     'Access-Control-Allow-Methods': 'GET,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   };
 }
 
-export default async function handler(req, res) {
-  const origin = req.headers.origin || '';
-  const headers = corsHeaders(origin, process.env.CORS_ALLOW);
+function send(res, status, data, extraHeaders = {}) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
+  res.end(data === null ? '' : JSON.stringify(data));
+}
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, headers).end();
-    return;
-  }
+function mockPayload(pro) {
+  return {
+    carrier: 'Estes',
+    pro,
+    status: 'In Transit',
+    estimatedDelivery: '09/04/2025 – 09/10/2025',
+    pieces: '12',
+    weight: '748',
+    events: [
+      { when: '2025-09-03 08:12', desc: 'Departed Terminal', city: 'Richmond', state: 'VA' },
+      { when: '2025-09-02 14:03', desc: 'Arrived at Terminal', city: 'Richmond', state: 'VA' },
+      { when: '2025-09-01 09:55', desc: 'Picked Up', city: 'Raleigh', state: 'NC' }
+    ]
+  };
+}
+
+module.exports = async (req, res) => {
+  const origin = req.headers.origin || '';
+  const headers = cors(origin, process.env.CORS_ALLOW);
+
+  // Preflight
+  if (req.method === 'OPTIONS') return send(res, 204, null, headers);
 
   try {
-    const pro = (req.query.pro || '').toString().replace(/\D/g, ''); // keep leading zeros
-    const mock = req.query.mock === '1';
-    if (!pro) return res.status(400).set(headers).json({ error: 'Missing or invalid PRO' });
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pro = (url.searchParams.get('pro') || '').replace(/\D/g, '');
+    const mock = url.searchParams.get('mock') === '1';
+    if (!pro) return send(res, 400, { error: 'Missing or invalid PRO' }, headers);
 
     const user = process.env.ESTES_USER;
     const pass = process.env.ESTES_PASS;
 
-    // No creds yet or explicit mock → return realistic fake so you can wire UI now
+    // Mock mode (or no creds yet)
     if (mock || !user || !pass) {
-      return res.status(200).set(headers).json({
-        carrier: 'Estes',
-        pro,
-        status: 'In Transit',
-        estimatedDelivery: '09/04/2025 – 09/10/2025',
-        pieces: '12',
-        weight: '748',
-        events: [
-          { when: '2025-09-03 08:12', desc: 'Departed Terminal', city: 'Richmond', state: 'VA' },
-          { when: '2025-09-02 14:03', desc: 'Arrived at Terminal', city: 'Richmond', state: 'VA' },
-          { when: '2025-09-01 09:55', desc: 'Picked Up', city: 'Raleigh', state: 'NC' }
-        ]
-      });
+      return send(res, 200, mockPayload(pro), headers);
     }
 
+    // Live SOAP call
     const soap = `
       <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
                         xmlns:ship="http://ws.estesexpress.com/shipmenttracking"
@@ -56,8 +68,7 @@ export default async function handler(req, res) {
         <soapenv:Body>
           <s1:search><s1:requestID>${Date.now()}</s1:requestID><s1:pro>${pro}</s1:pro></s1:search>
         </soapenv:Body>
-      </soapenv:Envelope>
-    `.trim();
+      </soapenv:Envelope>`.trim();
 
     const resp = await fetch(ENDPOINT, {
       method: 'POST',
@@ -67,7 +78,7 @@ export default async function handler(req, res) {
 
     const xml = await resp.text();
     if (!resp.ok) {
-      return res.status(resp.status).set(headers).json({ error: 'Estes service error', status: resp.status });
+      return send(res, resp.status, { error: 'Estes service error', status: resp.status }, headers);
     }
 
     const pick = (re) => (xml.match(re) || [])[1] || null;
@@ -75,7 +86,7 @@ export default async function handler(req, res) {
       pick(/<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i) ||
       pick(/<ship:statusDescription>\s*([^<]+)\s*<\/ship:statusDescription>/i) ||
       pick(/<status>\s*([^<]+)\s*<\/status>/i);
-    const est =
+    const estimatedDelivery =
       pick(/<deliveryDate>\s*([^<]+)\s*<\/deliveryDate>/i) ||
       pick(/<firstDeliveryDate>\s*([^<]+)\s*<\/firstDeliveryDate>/i) ||
       pick(/<ship:firstDeliveryDate>\s*([^<]+)\s*<\/ship:firstDeliveryDate>/i);
@@ -95,11 +106,9 @@ export default async function handler(req, res) {
       });
     }
 
-    res.status(200)
-      .set({ ...headers, 'Cache-Control': 's-maxage=60, stale-while-revalidate=300' })
-      .json({ carrier: 'Estes', pro, status, estimatedDelivery: est, pieces, weight, events });
-
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=300');
+    return send(res, 200, { carrier: 'Estes', pro, status, estimatedDelivery, pieces, weight, events }, headers);
   } catch (e) {
-    res.status(500).set(headers).json({ error: 'Server exception', details: String(e) });
+    return send(res, 500, { error: 'Server exception', details: String(e) }, headers);
   }
-}
+};
