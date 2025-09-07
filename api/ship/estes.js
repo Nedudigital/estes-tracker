@@ -1,18 +1,19 @@
 // api/ship/estes.js — Vercel Serverless function
-// Live Estes tracking via SOAP -> JSON.
-// Adds robust XML parsing, debug hints, and optional redirect mode.
+// Live Estes tracking via SOAP -> JSON with namespace stripping.
+// Also supports: ?format=redirect (for email deep-links), ?debug=1, ?raw=1.
 
 const ENDPOINT =
   'https://www.estes-express.com/shipmenttracking/services/ShipmentTrackingService';
 
-// Build a public Estes deep-link (digits-only PRO recommended)
+// Build a public Estes deep-link
 function deepLink(proDigits) {
   return `https://www.estes-express.com/myestes/shipment-tracking/?type=PRO&proNumbers=${encodeURIComponent(
     proDigits
   )}`;
 }
 
-// CORS helper
+// ---- CORS helpers ----------------------------------------------------------
+
 function cors(origin, allowList) {
   if (!allowList) {
     return {
@@ -39,6 +40,8 @@ function send(res, status, data, extraHeaders = {}) {
   for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
   res.end(data == null ? '' : JSON.stringify(data));
 }
+
+// ---- Mock (for local/dev) --------------------------------------------------
 
 function mockPayload(pro) {
   return {
@@ -89,7 +92,7 @@ async function soapRequest(soap, action) {
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
         SOAPAction: action,
-        'User-Agent': 'ArmadilloTough-EstesTracker/1.1 (+vercel)',
+        'User-Agent': 'ArmadilloTough-EstesTracker/1.2 (+vercel)',
       },
       body: soap,
       signal: controller.signal,
@@ -105,6 +108,11 @@ async function soapRequest(soap, action) {
 
 // ---- XML parsing -----------------------------------------------------------
 
+// Strip namespace prefixes in tag names, e.g. <ship:status> -> <status>
+function stripNamespaces(xml) {
+  return xml.replace(/(<\/?)([\w.-]+):([\w.-]+)(\b[^>]*>)/g, '$1$3$4');
+}
+
 function pick(xml, patterns) {
   for (const re of patterns) {
     const m = xml.match(re);
@@ -115,23 +123,20 @@ function pick(xml, patterns) {
 
 function parseEvents(xml) {
   const events = [];
-
-  // 1) <shipmentEvent> ... </shipmentEvent>
-  const re1 = /<shipmentEvent\b[\s\S]*?<\/shipmentEvent>/gi;
-
-  // 2) <eventDetail> ... </eventDetail>  (common in some Estes payloads)
-  const re2 = /<eventDetail\b[\s\S]*?<\/eventDetail>/gi;
-
-  // 3) generic <event> blocks but avoid the enclosing <eventList>
-  const re3 = /<event\b[\s\S]*?<\/event>/gi;
+  const reBlocks = [
+    /<shipmentEvent\b[\s\S]*?<\/shipmentEvent>/gi,
+    /<eventDetail\b[\s\S]*?<\/eventDetail>/gi,
+  ];
 
   const blocks = [];
-  let m;
-  while ((m = re1.exec(xml))) blocks.push(m[0]);
-  while ((m = re2.exec(xml))) blocks.push(m[0]);
+  for (const re of reBlocks) {
+    let m;
+    while ((m = re.exec(xml))) blocks.push(m[0]);
+  }
 
-  // Only use generic <event> if we didn't find the specific ones
   if (blocks.length === 0) {
+    let m;
+    const re3 = /<event\b[\s\S]*?<\/event>/gi;
     while ((m = re3.exec(xml))) {
       const b = m[0];
       if (!/^\s*<eventList/i.test(b)) blocks.push(b);
@@ -169,75 +174,70 @@ function parseEvents(xml) {
       /<description>\s*([^<]+)\s*<\/description>/i,
     ]);
 
-    const city = pick(b, [
-      /<statusCity>\s*([^<]+)\s*<\/statusCity>/i,
-      /<city>\s*([^<]+)\s*<\/city>/i,
-    ]);
+    const city = pick(b, [/ <statusCity>\s*([^<]+)\s*<\/statusCity>/i, /<city>\s*([^<]+)\s*<\/city>/i ]);
+    const state = pick(b, [/ <statusState>\s*([^<]+)\s*<\/statusState>/i, /<state>\s*([^<]+)\s*<\/state>/i ]);
 
-    const state = pick(b, [
-      /<statusState>\s*([^<]+)\s*<\/statusState>/i,
-      /<state>\s*([^<]+)\s*<\/state>/i,
-    ]);
-
-    if (when || desc || city || state) {
-      events.push({ when, desc, city, state });
-    }
+    if (when || desc || city || state) events.push({ when, desc, city, state });
   }
 
   return events;
 }
 
 function parseXml(xml) {
-  // SOAP Fault?
+  // Fault?
   const fault =
     (xml.match(/<faultstring>\s*([^<]+)\s*<\/faultstring>/i) || [])[1] ||
     (xml.match(/<soap:Fault>[\s\S]*?<\/soap:Fault>/i) || [])[0];
   if (fault) return { error: `SOAP fault: ${fault}` };
 
-  // Some Estes responses wrap in <ship:trackingInfo> … grab inside for searching
+  // The useful bits are under <trackingInfo> … possibly namespaced (now stripped)
   const trackingInfoBlock =
-    (xml.match(/<(?:\w+:)?trackingInfo\b[\s\S]*?<\/(?:\w+:)?trackingInfo>/i) || [])[0] || xml;
+    (xml.match(/<trackingInfo\b[\s\S]*?<\/trackingInfo>/i) || [])[0] || xml;
 
-  // Primary fields
-  const status =
-    pick(trackingInfoBlock, [
-      /<statusCodeDescription>\s*([^<]+)\s*<\/statusCodeDescription>/i,
-      /<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i,
-      /<currentStatus>\s*([^<]+)\s*<\/currentStatus>/i,
-      /<status>\s*([^<]+)\s*<\/status>/i,
-    ]) || null;
+  // Pull primary fields anywhere inside trackingInfo (including inside <shipments><shipment>)
+  const status = pick(trackingInfoBlock, [
+    /<statusCodeDescription>\s*([^<]+)\s*<\/statusCodeDescription>/i,
+    /<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i,
+    /<currentStatus>\s*([^<]+)\s*<\/currentStatus>/i,
+    /<status>\s*([^<]+)\s*<\/status>/i,
+  ]);
 
-  const estimatedDelivery =
-    pick(trackingInfoBlock, [
-      /<deliveryDate>\s*([^<]+)\s*<\/deliveryDate>/i,
-      /<estimatedDeliveryDate>\s*([^<]+)\s*<\/estimatedDeliveryDate>/i,
-      /<firstDeliveryDate>\s*([^<]+)\s*<\/firstDeliveryDate>/i,
-      /<deliveryApptDate>\s*([^<]+)\s*<\/deliveryApptDate>/i,
-      /<appointmentDate>\s*([^<]+)\s*<\/appointmentDate>/i,
-    ]) || null;
+  const deliveryDate = pick(trackingInfoBlock, [
+    /<deliveryDate>\s*([^<]+)\s*<\/deliveryDate>/i,
+    /<estimatedDeliveryDate>\s*([^<]+)\s*<\/estimatedDeliveryDate>/i,
+    /<firstDeliveryDate>\s*([^<]+)\s*<\/firstDeliveryDate>/i,
+    /<deliveryApptDate>\s*([^<]+)\s*<\/deliveryApptDate>/i,
+    /<appointmentDate>\s*([^<]+)\s*<\/appointmentDate>/i,
+  ]);
 
-  const pieces =
-    pick(trackingInfoBlock, [
-      /<pieces>\s*([^<]+)\s*<\/pieces>/i,
-      /<totalPieces>\s*([^<]+)\s*<\/totalPieces>/i,
-      /<pieceCount>\s*([^<]+)\s*<\/pieceCount>/i,
-    ]) || null;
+  const deliveryTime = pick(trackingInfoBlock, [
+    /<deliveryTime>\s*([^<]+)\s*<\/deliveryTime>/i,
+    /<appointmentTime>\s*([^<]+)\s*<\/appointmentTime>/i,
+  ]);
 
-  const weight =
-    pick(trackingInfoBlock, [
-      /<weight>\s*([^<]+)\s*<\/weight>/i,
-      /<totalWeight>\s*([^<]+)\s*<\/totalWeight>/i,
-      /<weightLbs>\s*([^<]+)\s*<\/weightLbs>/i,
-    ]) || null;
+  const pieces = pick(trackingInfoBlock, [
+    /<pieces>\s*([^<]+)\s*<\/pieces>/i,
+    /<totalPieces>\s*([^<]+)\s*<\/totalPieces>/i,
+    /<pieceCount>\s*([^<]+)\s*<\/pieceCount>/i,
+  ]);
 
-  // Events
+  const weight = pick(trackingInfoBlock, [
+    /<weight>\s*([^<]+)\s*<\/weight>/i,
+    /<totalWeight>\s*([^<]+)\s*<\/totalWeight>/i,
+    /<weightLbs>\s*([^<]+)\s*<\/weightLbs>/i,
+  ]);
+
+  const receivedBy = pick(trackingInfoBlock, [/<receivedBy>\s*([^<]+)\s*<\/receivedBy>/i]);
+
   const events = parseEvents(trackingInfoBlock);
 
-  if (!status && !estimatedDelivery && events.length === 0) {
+  if (!status && !deliveryDate && events.length === 0) {
     return { error: 'No tracking result in response' };
   }
 
-  return { status, estimatedDelivery, pieces, weight, events };
+  const estimatedDelivery = deliveryTime ? `${deliveryDate} ${deliveryTime}` : deliveryDate;
+
+  return { status, estimatedDelivery, pieces, weight, receivedBy, events };
 }
 
 // ---- Handler ---------------------------------------------------------------
@@ -296,15 +296,18 @@ module.exports = async (req, res) => {
     }
 
     if (rawXml) {
-      // Debug-only: return the first chunk of XML to inspect schema quickly.
-      return send(res, 200, { xml: result.xml.slice(0, 4000) }, headers);
+      // Return the raw XML (namespace-stripped) for debugging
+      const xmlNoNs = stripNamespaces(result.xml);
+      return send(res, 200, { xml: xmlNoNs.slice(0, 4000) }, headers);
     }
 
-    const parsed = parseXml(result.xml);
+    // *** Fix: strip namespaces, then parse ***
+    const xmlNoNs = stripNamespaces(result.xml);
+    const parsed = parseXml(xmlNoNs);
 
     if (parsed.error) {
       const payload = { error: parsed.error, carrier: 'Estes', pro, link: deepLink(pro) };
-      if (debug) payload.hint = (result.xml || '').slice(0, 1200);
+      if (debug) payload.hint = (xmlNoNs || '').slice(0, 1200);
       return send(res, 404, payload, headers);
     }
 
@@ -319,6 +322,7 @@ module.exports = async (req, res) => {
         estimatedDelivery: parsed.estimatedDelivery,
         pieces: parsed.pieces,
         weight: parsed.weight,
+        receivedBy: parsed.receivedBy,
         events: parsed.events,
         link: deepLink(pro),
       },
