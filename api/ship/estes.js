@@ -1,6 +1,6 @@
 // api/ship/estes.js — Vercel Serverless function
-// Returns live JSON from Estes ShipmentTrackingService.
-// Extras: redirect mode for email links, debug hints, robust XML parsing.
+// Live Estes tracking via SOAP -> JSON.
+// Adds robust XML parsing, debug hints, and optional redirect mode.
 
 const ENDPOINT =
   'https://www.estes-express.com/shipmenttracking/services/ShipmentTrackingService';
@@ -12,7 +12,7 @@ function deepLink(proDigits) {
   )}`;
 }
 
-// CORS helper (optional allowlist via CORS_ALLOW; adds Vary: Origin)
+// CORS helper
 function cors(origin, allowList) {
   if (!allowList) {
     return {
@@ -82,14 +82,14 @@ function buildSoap(pro, user, pass) {
 
 async function soapRequest(soap, action) {
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 10000); // 10s timeout
+  const t = setTimeout(() => controller.abort(), 10000);
   try {
     const resp = await fetch(ENDPOINT, {
       method: 'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
         SOAPAction: action,
-        'User-Agent': 'ArmadilloTough-EstesTracker/1.0 (+vercel)',
+        'User-Agent': 'ArmadilloTough-EstesTracker/1.1 (+vercel)',
       },
       body: soap,
       signal: controller.signal,
@@ -103,55 +103,135 @@ async function soapRequest(soap, action) {
   }
 }
 
+// ---- XML parsing -----------------------------------------------------------
+
+function pick(xml, patterns) {
+  for (const re of patterns) {
+    const m = xml.match(re);
+    if (m && m[1]) return m[1];
+  }
+  return null;
+}
+
+function parseEvents(xml) {
+  const events = [];
+
+  // 1) <shipmentEvent> ... </shipmentEvent>
+  const re1 = /<shipmentEvent\b[\s\S]*?<\/shipmentEvent>/gi;
+
+  // 2) <eventDetail> ... </eventDetail>  (common in some Estes payloads)
+  const re2 = /<eventDetail\b[\s\S]*?<\/eventDetail>/gi;
+
+  // 3) generic <event> blocks but avoid the enclosing <eventList>
+  const re3 = /<event\b[\s\S]*?<\/event>/gi;
+
+  const blocks = [];
+  let m;
+  while ((m = re1.exec(xml))) blocks.push(m[0]);
+  while ((m = re2.exec(xml))) blocks.push(m[0]);
+
+  // Only use generic <event> if we didn't find the specific ones
+  if (blocks.length === 0) {
+    while ((m = re3.exec(xml))) {
+      const b = m[0];
+      if (!/^\s*<eventList/i.test(b)) blocks.push(b);
+    }
+  }
+
+  for (const b of blocks) {
+    const when =
+      pick(b, [
+        /<eventDateTime>\s*([^<]+)\s*<\/eventDateTime>/i,
+        /<statusDateTime>\s*([^<]+)\s*<\/statusDateTime>/i,
+        /<statusDate>\s*([^<]+)\s*<\/statusDate>/i,
+        /<eventDate>\s*([^<]+)\s*<\/eventDate>/i,
+      ]) ||
+      (() => {
+        const d =
+          pick(b, [
+            /<eventDate>\s*([^<]+)\s*<\/eventDate>/i,
+            /<statusDate>\s*([^<]+)\s*<\/statusDate>/i,
+            /<date>\s*([^<]+)\s*<\/date>/i,
+          ]) || '';
+        const t =
+          pick(b, [
+            /<eventTime>\s*([^<]+)\s*<\/eventTime>/i,
+            /<statusTime>\s*([^<]+)\s*<\/statusTime>/i,
+            /<time>\s*([^<]+)\s*<\/time>/i,
+          ]) || '';
+        return (d || t) ? [d, t].filter(Boolean).join(' ') : null;
+      })();
+
+    const desc = pick(b, [
+      /<statusCodeDescription>\s*([^<]+)\s*<\/statusCodeDescription>/i,
+      /<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i,
+      /<event>\s*([^<]+)\s*<\/event>/i,
+      /<description>\s*([^<]+)\s*<\/description>/i,
+    ]);
+
+    const city = pick(b, [
+      /<statusCity>\s*([^<]+)\s*<\/statusCity>/i,
+      /<city>\s*([^<]+)\s*<\/city>/i,
+    ]);
+
+    const state = pick(b, [
+      /<statusState>\s*([^<]+)\s*<\/statusState>/i,
+      /<state>\s*([^<]+)\s*<\/state>/i,
+    ]);
+
+    if (when || desc || city || state) {
+      events.push({ when, desc, city, state });
+    }
+  }
+
+  return events;
+}
+
 function parseXml(xml) {
+  // SOAP Fault?
   const fault =
     (xml.match(/<faultstring>\s*([^<]+)\s*<\/faultstring>/i) || [])[1] ||
     (xml.match(/<soap:Fault>[\s\S]*?<\/soap:Fault>/i) || [])[0];
   if (fault) return { error: `SOAP fault: ${fault}` };
 
-  const pick = (re) => (xml.match(re) || [])[1] || null;
+  // Some Estes responses wrap in <ship:trackingInfo> … grab inside for searching
+  const trackingInfoBlock =
+    (xml.match(/<(?:\w+:)?trackingInfo\b[\s\S]*?<\/(?:\w+:)?trackingInfo>/i) || [])[0] || xml;
 
-  // Status
+  // Primary fields
   const status =
-    pick(/<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i) ||
-    pick(/<ship:statusDescription>\s*([^<]+)\s*<\/ship:statusDescription>/i) ||
-    pick(/<currentStatus>\s*([^<]+)\s*<\/currentStatus>/i) ||
-    pick(/<status>\s*([^<]+)\s*<\/status>/i);
+    pick(trackingInfoBlock, [
+      /<statusCodeDescription>\s*([^<]+)\s*<\/statusCodeDescription>/i,
+      /<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i,
+      /<currentStatus>\s*([^<]+)\s*<\/currentStatus>/i,
+      /<status>\s*([^<]+)\s*<\/status>/i,
+    ]) || null;
 
-  // ETA
   const estimatedDelivery =
-    pick(/<deliveryDate>\s*([^<]+)\s*<\/deliveryDate>/i) ||
-    pick(/<estimatedDeliveryDate>\s*([^<]+)\s*<\/estimatedDeliveryDate>/i) ||
-    pick(/<firstDeliveryDate>\s*([^<]+)\s*<\/firstDeliveryDate>/i) ||
-    pick(/<ship:firstDeliveryDate>\s*([^<]+)\s*<\/ship:firstDeliveryDate>/i);
+    pick(trackingInfoBlock, [
+      /<deliveryDate>\s*([^<]+)\s*<\/deliveryDate>/i,
+      /<estimatedDeliveryDate>\s*([^<]+)\s*<\/estimatedDeliveryDate>/i,
+      /<firstDeliveryDate>\s*([^<]+)\s*<\/firstDeliveryDate>/i,
+      /<deliveryApptDate>\s*([^<]+)\s*<\/deliveryApptDate>/i,
+      /<appointmentDate>\s*([^<]+)\s*<\/appointmentDate>/i,
+    ]) || null;
 
-  // Pieces/weight
   const pieces =
-    pick(/<pieces>\s*([^<]+)\s*<\/pieces>/i) || pick(/<totalPieces>\s*([^<]+)\s*<\/totalPieces>/i);
+    pick(trackingInfoBlock, [
+      /<pieces>\s*([^<]+)\s*<\/pieces>/i,
+      /<totalPieces>\s*([^<]+)\s*<\/totalPieces>/i,
+      /<pieceCount>\s*([^<]+)\s*<\/pieceCount>/i,
+    ]) || null;
+
   const weight =
-    pick(/<weight>\s*([^<]+)\s*<\/weight>/i) || pick(/<totalWeight>\s*([^<]+)\s*<\/totalWeight>/i);
+    pick(trackingInfoBlock, [
+      /<weight>\s*([^<]+)\s*<\/weight>/i,
+      /<totalWeight>\s*([^<]+)\s*<\/totalWeight>/i,
+      /<weightLbs>\s*([^<]+)\s*<\/weightLbs>/i,
+    ]) || null;
 
   // Events
-  const events = [];
-  const reEvent = /<shipmentEvent\b[\s\S]*?<\/shipmentEvent>/gi;
-  let m;
-  while ((m = reEvent.exec(xml))) {
-    const b = m[0];
-    const dateTime =
-      (b.match(/<eventDateTime>\s*([^<]+)\s*<\/eventDateTime>/i) || [])[1] ||
-      (() => {
-        const d = (b.match(/<eventDate>\s*([^<]+)\s*<\/eventDate>/i) || [])[1];
-        const t = (b.match(/<eventTime>\s*([^<]+)\s*<\/eventTime>/i) || [])[1];
-        return d || t ? [d, t].filter(Boolean).join(' ') : null;
-      })();
-
-    events.push({
-      when: dateTime,
-      desc: (b.match(/<event>\s*([^<]+)\s*<\/event>/i) || [])[1] || null,
-      city: (b.match(/<city>\s*([^<]+)\s*<\/city>/i) || [])[1] || null,
-      state: (b.match(/<state>\s*([^<]+)\s*<\/state>/i) || [])[1] || null,
-    });
-  }
+  const events = parseEvents(trackingInfoBlock);
 
   if (!status && !estimatedDelivery && events.length === 0) {
     return { error: 'No tracking result in response' };
@@ -176,6 +256,7 @@ module.exports = async (req, res) => {
     const mock = url.searchParams.get('mock') === '1';
     const format = url.searchParams.get('format') || 'json';
     const debug = url.searchParams.get('debug') === '1';
+    const rawXml = url.searchParams.get('raw') === '1';
 
     if (!pro) return send(res, 400, { error: 'Missing or invalid PRO' }, headers);
 
@@ -188,7 +269,6 @@ module.exports = async (req, res) => {
     const user = process.env.ESTES_USER;
     const pass = process.env.ESTES_PASS;
 
-    // Only mock if explicitly requested
     if (mock) {
       res.setHeader('Cache-Control', 'no-store');
       return send(res, 200, mockPayload(pro), headers);
@@ -199,7 +279,7 @@ module.exports = async (req, res) => {
 
     const soap = buildSoap(pro, user, pass);
 
-    // Try common SOAPAction strings (providers vary)
+    // Try common SOAPAction strings
     let result = await soapRequest(soap, 'search');
     if (!result.ok || /Fault/i.test(result.xml) || /__NETWORK__/.test(result.xml)) {
       const alt = await soapRequest(soap, 'ShipmentTrackingService/search');
@@ -215,11 +295,16 @@ module.exports = async (req, res) => {
       );
     }
 
+    if (rawXml) {
+      // Debug-only: return the first chunk of XML to inspect schema quickly.
+      return send(res, 200, { xml: result.xml.slice(0, 4000) }, headers);
+    }
+
     const parsed = parseXml(result.xml);
 
     if (parsed.error) {
       const payload = { error: parsed.error, carrier: 'Estes', pro, link: deepLink(pro) };
-      if (debug) payload.hint = (result.xml || '').slice(0, 240);
+      if (debug) payload.hint = (result.xml || '').slice(0, 1200);
       return send(res, 404, payload, headers);
     }
 
