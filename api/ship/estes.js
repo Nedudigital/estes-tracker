@@ -1,5 +1,6 @@
 // api/ship/estes.js — Vercel Serverless function
-// Live Estes tracking JSON + optional redirect mode for email links.
+// Returns live JSON from Estes ShipmentTrackingService.
+// Extras: redirect mode for email links, debug hints, robust XML parsing.
 
 const ENDPOINT =
   'https://www.estes-express.com/shipmenttracking/services/ShipmentTrackingService';
@@ -103,7 +104,6 @@ async function soapRequest(soap, action) {
 }
 
 function parseXml(xml) {
-  // SOAP Fault?
   const fault =
     (xml.match(/<faultstring>\s*([^<]+)\s*<\/faultstring>/i) || [])[1] ||
     (xml.match(/<soap:Fault>[\s\S]*?<\/soap:Fault>/i) || [])[0];
@@ -111,25 +111,27 @@ function parseXml(xml) {
 
   const pick = (re) => (xml.match(re) || [])[1] || null;
 
-  // Status: try several tag names
+  // Status
   const status =
     pick(/<statusDescription>\s*([^<]+)\s*<\/statusDescription>/i) ||
     pick(/<ship:statusDescription>\s*([^<]+)\s*<\/ship:statusDescription>/i) ||
     pick(/<currentStatus>\s*([^<]+)\s*<\/currentStatus>/i) ||
     pick(/<status>\s*([^<]+)\s*<\/status>/i);
 
-  // ETA variants
+  // ETA
   const estimatedDelivery =
     pick(/<deliveryDate>\s*([^<]+)\s*<\/deliveryDate>/i) ||
     pick(/<estimatedDeliveryDate>\s*([^<]+)\s*<\/estimatedDeliveryDate>/i) ||
     pick(/<firstDeliveryDate>\s*([^<]+)\s*<\/firstDeliveryDate>/i) ||
     pick(/<ship:firstDeliveryDate>\s*([^<]+)\s*<\/ship:firstDeliveryDate>/i);
 
-  // Pieces/weight variants
-  const pieces = pick(/<pieces>\s*([^<]+)\s*<\/pieces>/i) || pick(/<totalPieces>\s*([^<]+)\s*<\/totalPieces>/i);
-  const weight = pick(/<weight>\s*([^<]+)\s*<\/weight>/i) || pick(/<totalWeight>\s*([^<]+)\s*<\/totalWeight>/i);
+  // Pieces/weight
+  const pieces =
+    pick(/<pieces>\s*([^<]+)\s*<\/pieces>/i) || pick(/<totalPieces>\s*([^<]+)\s*<\/totalPieces>/i);
+  const weight =
+    pick(/<weight>\s*([^<]+)\s*<\/weight>/i) || pick(/<totalWeight>\s*([^<]+)\s*<\/totalWeight>/i);
 
-  // Events (date+time sometimes split)
+  // Events
   const events = [];
   const reEvent = /<shipmentEvent\b[\s\S]*?<\/shipmentEvent>/gi;
   let m;
@@ -186,9 +188,13 @@ module.exports = async (req, res) => {
     const user = process.env.ESTES_USER;
     const pass = process.env.ESTES_PASS;
 
-    if (mock || !user || !pass) {
+    // Only mock if explicitly requested
+    if (mock) {
       res.setHeader('Cache-Control', 'no-store');
       return send(res, 200, mockPayload(pro), headers);
+    }
+    if (!user || !pass) {
+      return send(res, 500, { error: 'Missing ESTES_USER or ESTES_PASS in env' }, headers);
     }
 
     const soap = buildSoap(pro, user, pass);
